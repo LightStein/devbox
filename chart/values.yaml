@@ -1,0 +1,155 @@
+# devbox - per-user in-cluster workstation.
+#
+# One release per user. app_name carries the user suffix (devbox-alice), so
+# every object - StatefulSet, Service, Route, PVCs, ServiceAccount - is named
+# for that user and the Route lands on devbox-<user>.apps.dev.example.com.
+# Set app_name in the ArgoCD Application, not here.
+app_name: devbox
+replicas: 1
+
+# code-server listens here on 127.0.0.1 only. oauth-proxy is the only thing
+# that can reach it, and the Route only reaches oauth-proxy.
+CODE_SERVER_PORT: '8080'
+PROXY_PORT: '4180'
+
+image:
+  registry: registry.example.com
+  repository: devops/devbox
+  tag: v0.1.8
+  pullPolicy: IfNotPresent
+
+# OpenShift's oauth-proxy. Must be mirrored into Nexus before first deploy -
+# the cluster cannot pull from quay.
+proxyImage:
+  registry: registry.example.com
+  repository: devops/oauth-proxy
+  tag: 4.18
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+    ephemeral-storage: 4Gi
+  requests:
+    cpu: 200m
+    memory: 1Gi
+    ephemeral-storage: 1Gi
+
+proxyResources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 20m
+    memory: 64Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+affinity: {}
+
+env: dev
+dev_hostname: apps.dev.example.com
+prod_hostname: apps.prod.example.com
+drc_hostname: apps.dr.example.com
+
+# CephFS, not the default class. The default is `thin`, the in-tree vSphere
+# provisioner - which is how another workload ended up with a volume vCenter refused to
+# detach for nine days in July 2026. RWX on CephFS lets the pod reschedule to
+# any node without a detach ever being needed.
+persistence:
+  storageClassName: ocs-storagecluster-cephfs
+  accessMode: ReadWriteMany
+  # /home/dev - dotfiles, scripts, shell history, kubeconfig. Backed up.
+  home:
+    size: 10Gi
+  # /work - clones, extracts, dx output. Disposable.
+  work:
+    size: 30Gi
+
+# Secrets are NOT managed by this chart and are NOT in git.
+#
+# Sealing them cluster-wide - the repo convention - would strip the namespace
+# binding from the ciphertext, so anyone able to commit here could unseal
+# another user's SSH keys in a namespace they control. Created out of band
+# instead, the same way another workload-secrets is. See README.
+secrets:
+  # Holds session_secret for oauth-proxy.
+  proxy: ""      # defaults to <app_name>-proxy-secrets
+  # Holds SSH private keys. Mounted at /run/secrets/devbox-ssh; the entrypoint
+  # copies them to ~/.ssh at 0600, since a Secret mount is read-only and ssh
+  # rejects the permissions.
+  ssh: ""        # defaults to <app_name>-ssh
+  # Optional: NEXUS_USER / NEXUS_PASS etc, surfaced as env vars.
+  env: ""        # defaults to <app_name>-env-secrets, skipped if absent
+
+# Grants the pod ServiceAccount cluster-wide read via ClusterRoleBinding to the
+# built-in cluster-reader role.
+#
+# Leave this false on the `dev` AppProject: its clusterResourceWhitelist allows
+# only Namespace, so ArgoCD cannot create a ClusterRoleBinding and the resource
+# hangs in Progressing forever with no status. Apply the binding out of band
+# instead - see README. Set true only under a project that permits it.
+rbac:
+  clusterReader: false
+  # Binds the built-in `edit` ClusterRole to the pod ServiceAccount within this
+  # namespace only, via a RoleBinding. That is what allows exec, port-forward
+  # and deleting your own pod from inside devbox - cluster-reader is read-only
+  # and covers none of them.
+  #
+  # Namespaced, so the shared `dev` AppProject permits it, unlike the
+  # cluster-scoped binding above. Scope stops at this namespace: no
+  # cluster-scoped resources and no other namespace. `edit` not `admin`, so the
+  # pod cannot grant itself more.
+  namespaceEdit: true
+
+route:
+  timeout: 10m
+
+preview:
+  replicas: 0
+  config: []
+
+dev:
+  replicas: 1
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+      ephemeral-storage: 4Gi
+    requests:
+      cpu: 200m
+      memory: 1Gi
+      ephemeral-storage: 1Gi
+  config:
+    DEVBOX_HOME: "/home/dev"
+    DEVBOX_WORK: "/work"
+    SHELL: "/bin/bash"
+    LANG: "C.UTF-8"
+    # Hosts whose issuing CA is not in the cluster-injected bundle. The
+    # entrypoint pins each one on first start and composes a bundle that
+    # openssl, python, node, git and curl are all pointed at. Without this,
+    # Nexus fails with "unable to get issuer certificate" and anything using
+    # Node - the Jenkins extension included - fails the same way, because Node
+    # ignores the system trust store entirely.
+    #
+    # Space separated, host or host:port. Add to it with `trustca <host>`,
+    # which persists to the home volume.
+    DEVBOX_TRUST_HOSTS: "nexus.example.com jenkins.example.com gitlab.example.com gitlab-legacy.example.com"
+
+uat:
+  replicas: 0
+  config: []
+
+prod:
+  replicas: 0
+  config: []
+
+drc:
+  replicas: 0
+  config: []

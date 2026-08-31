@@ -1,0 +1,35 @@
+{{/*
+Namespace-scoped write for the pod's own ServiceAccount.
+
+cluster-reader gives read across the cluster but no exec, no port-forward and
+no delete - so devbox could see everything and change nothing, including its
+own pod. Restarting it after a CA import or an extension change meant leaving
+the box and using the console.
+
+This binds `edit` in the release namespace only. It covers exec, port-forward,
+and create/update/delete of ordinary objects there, and stops at the namespace
+boundary: no cluster-scoped resources, no other namespaces.
+
+`edit` rather than `admin` on purpose - admin can also manage RoleBindings, so
+the pod could widen its own access within the namespace. edit cannot.
+
+Unlike the ClusterRoleBinding in serviceaccount.yaml this is namespaced, so the
+shared `dev` AppProject permits it and ArgoCD can create it normally.
+*/}}
+{{- if .Values.rbac.namespaceEdit }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.app_name }}-edit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "helm.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.app_name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+{{- end }}

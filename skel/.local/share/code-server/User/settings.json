@@ -1,0 +1,36 @@
+{
+  // Select in the terminal and it lands on the system clipboard. This is
+  // VS Code's own copy-on-select, not zellij's - zellij's writes to an
+  // internal buffer the browser cannot reach, which is why it is off in
+  // config.kdl. This one is the real thing.
+  "terminal.integrated.copyOnSelection": true,
+  "terminal.integrated.defaultProfile.linux": "zsh",
+  "terminal.integrated.scrollback": 20000,
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 1000,
+
+  // Shows incoming commits in the Source Control panel without asking, so a
+  // stale branch is visible before you try to push rather than after.
+  "git.autofetch": true,
+  // Sync = pull then push, in that order. git has no such thing natively.
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+
+  // Font family falls back to plain monospace if the nerd font is not
+  // installed on the client, so this is safe as a default. Ligatures turn
+  // != -> => into single glyphs, which reads well in YAML and shell.
+  "terminal.integrated.fontFamily": "'JetBrainsMono Nerd Font', 'Droid Sans Mono', monospace",
+  "editor.fontFamily": "'JetBrainsMono Nerd Font', 'Droid Sans Mono', monospace",
+  "editor.fontLigatures": true,
+
+  "workbench.iconTheme": "vs-seti",
+  "editor.renderWhitespace": "trailing",
+  "editor.rulers": [80, 120],
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "[yaml]": {
+    "editor.tabSize": 2,
+    "editor.insertSpaces": true,
+    "editor.autoIndent": "keep"
+  }
+}

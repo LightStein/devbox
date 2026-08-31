@@ -1,0 +1,50 @@
+{{/*
+Two claims, deliberately separate.
+
+home is the workstation - dotfiles, scripts, shell history, kubeconfig. It is
+annotated keep + Prune=false so an ArgoCD prune or a chart removal never takes
+it with them. That is the whole point of the exercise: the PC gets wiped, this
+does not.
+
+work is scratch. Losing it costs a re-clone.
+
+Both are RWX on CephFS rather than the default `thin` class, so the pod can
+move between nodes without a vSphere detach ever being involved.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.app_name }}-home
+  labels:
+    {{- include "helm.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  {{- with .Values.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.home.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.app_name }}-work
+  labels:
+    {{- include "helm.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  {{- with .Values.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.work.size }}

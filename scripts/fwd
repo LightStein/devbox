@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# fwd - reach a remote service through devbox, in your browser.
+#
+# MobaXterm's port-forwarding manager, done with the two pieces already here:
+# ssh -L brings the remote port to the pod, and code-server's built-in proxy
+# publishes it to your browser at /proxy/<port>/. Nothing is installed on your
+# PC and no tunnel software is involved.
+#
+#   fwd add <host> <remote-port> [local-port]   start a tunnel
+#   fwd list                                    show active tunnels
+#   fwd rm <local-port>                         stop one
+#   fwd rmall                                   stop all
+#
+# Example - a WebLogic console on an app server:
+#   fwd add app-server1 7001
+#   -> https://devbox-<user>.apps.dev.example.com/proxy/7001/
+set -uo pipefail
+
+STATE="${DEVBOX_HOME:-$HOME}/.local/state/devbox-fwd"
+mkdir -p "$STATE"
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+
+base_url() {
+  # The Route hostname is not injected into the pod, so derive it from the
+  # app name if we can and fall back to a placeholder otherwise.
+  if [ -n "${DEVBOX_ROUTE:-}" ]; then
+    echo "https://${DEVBOX_ROUTE}"
+  else
+    echo "https://<your-devbox-route>"
+  fi
+}
+
+cmd_add() {
+  local host="${1:-}" rport="${2:-}" lport="${3:-${2:-}}"
+  if [ -z "$host" ] || [ -z "$rport" ]; then usage; return 2; fi
+
+  if ss -ltn 2>/dev/null | grep -q ":${lport} "; then
+    echo "fwd: local port ${lport} is already in use" >&2
+    return 1
+  fi
+
+  # -N: no remote command, this is a tunnel only.
+  # -f would background it but loses the pid; keep it explicit instead.
+  ssh -N -L "127.0.0.1:${lport}:127.0.0.1:${rport}" "$host" &
+  local pid=$!
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "fwd: tunnel to ${host} failed - try 'ssh ${host}' first" >&2
+    return 1
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$pid" "$host" "$rport" "$lport" \
+    > "${STATE}/${lport}"
+  echo "forwarding ${host}:${rport} -> 127.0.0.1:${lport}  (pid ${pid})"
+  echo
+  echo "  $(base_url)/proxy/${lport}/"
+  echo
+  echo "Open that in the browser tab you already have devbox in - it goes"
+  echo "through the same login, so no extra authentication."
+}
+
+cmd_list() {
+  local any=0
+  for f in "$STATE"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r pid host rport lport < "$f"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '%-6s %-24s remote:%-6s local:%-6s %s/proxy/%s/\n' \
+        "$pid" "$host" "$rport" "$lport" "$(base_url)" "$lport"
+      any=1
+    else
+      rm -f "$f"   # died, or the pod restarted
+    fi
+  done
+  [ "$any" = 1 ] || echo "no active tunnels"
+}
+
+cmd_rm() {
+  local lport="${1:-}"
+  [ -n "$lport" ] || { usage; return 2; }
+  local f="${STATE}/${lport}"
+  [ -f "$f" ] || { echo "fwd: nothing forwarded on ${lport}" >&2; return 1; }
+  IFS=$'\t' read -r pid host rport _ < "$f"
+  kill "$pid" 2>/dev/null && echo "stopped ${host}:${rport} on ${lport}"
+  rm -f "$f"
+}
+
+cmd_rmall() {
+  for f in "$STATE"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r pid _ _ lport < "$f"
+    kill "$pid" 2>/dev/null
+    rm -f "$f"
+    echo "stopped ${lport}"
+  done
+}
+
+case "${1:-}" in
+  add)   shift; cmd_add "$@" ;;
+  list|ls) cmd_list ;;
+  rm)    shift; cmd_rm "$@" ;;
+  rmall) cmd_rmall ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "fwd: unknown subcommand '$1'" >&2; usage; exit 2 ;;
+esac

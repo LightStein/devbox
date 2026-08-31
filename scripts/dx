@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# dx - capture command output to a file instead of copying it out of a terminal.
+#
+# The PC has no CLI and no oc, so the only way out of this pod is the browser.
+# Everything dx writes lands in $DEVBOX_WORK/out, which the file browser Route
+# serves - download it there and drop it straight into Slack.
+set -uo pipefail
+
+OUT_DIR="${DEVBOX_WORK:-/work}/out"
+mkdir -p "$OUT_DIR"
+
+stamp() { date -u +%Y%m%d-%H%M%S; }
+
+usage() {
+  cat <<'EOF'
+dx - capture output for handoff
+
+  dx run <command...>     run a command, tee output to a timestamped file
+  dx sh <script.sh>       run a script file the same way
+  dx bundle [name]        collect a standard cluster diagnostic set
+  dx ls                   list captured output, newest last
+  dx cat <file>           print a captured file
+  dx clean [days]         delete captures older than N days (default 7)
+
+All output goes to $DEVBOX_WORK/out. Download via the file browser Route.
+EOF
+}
+
+cmd_run() {
+  if [ $# -eq 0 ]; then echo "dx run: nothing to run" >&2; return 2; fi
+  local f="${OUT_DIR}/$(stamp)-run.txt"
+  {
+    echo "# $(date -u +%FT%TZ)"
+    echo "# \$ $*"
+    echo
+    "$@" 2>&1
+    echo
+    echo "# exit=$?"
+  } | tee "$f"
+  echo
+  echo ">> $f"
+}
+
+cmd_sh() {
+  local script="${1:-}"
+  if [ -z "$script" ] || [ ! -f "$script" ]; then
+    echo "dx sh: no such script: ${script:-<none>}" >&2; return 2
+  fi
+  local f="${OUT_DIR}/$(stamp)-$(basename "${script%.sh}").txt"
+  {
+    echo "# $(date -u +%FT%TZ)"
+    echo "# script: $script"
+    echo
+    bash "$script" 2>&1
+    echo
+    echo "# exit=$?"
+  } | tee "$f"
+  echo
+  echo ">> $f"
+}
+
+cmd_bundle() {
+  local name="${1:-bundle}"
+  local dir="${OUT_DIR}/$(stamp)-${name}"
+  mkdir -p "$dir"
+
+  grab() {
+    local label="$1"; shift
+    echo "  ${label}"
+    { echo "\$ $*"; echo; "$@" 2>&1; } > "${dir}/${label}.txt"
+  }
+
+  echo "collecting into ${dir}"
+  grab nodes            oc get nodes -o wide
+  grab nodes-conditions oc get nodes -o json
+  grab pods-unhealthy   oc get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
+  grab events           oc get events -A --sort-by=.lastTimestamp
+  grab volumeattachment oc get volumeattachment
+  grab pvc              oc get pvc -A
+  grab pv               oc get pv
+  grab storageclass     oc get sc
+  grab co               oc get clusteroperators
+  grab csi-pods         oc -n openshift-cluster-csi-drivers get pods -o wide
+
+  local archive="${dir}.tar.gz"
+  tar -czf "$archive" -C "$OUT_DIR" "$(basename "$dir")"
+  echo
+  echo ">> ${archive}"
+  echo "   download via the file browser and drop it into Slack"
+}
+
+cmd_ls()    { ls -lhtr "$OUT_DIR"; }
+cmd_cat()   { cat "${OUT_DIR}/${1:?dx cat: need a filename}"; }
+cmd_clean() { find "$OUT_DIR" -mindepth 1 -mtime "+${1:-7}" -print -delete; }
+
+case "${1:-}" in
+  run)    shift; cmd_run "$@" ;;
+  sh)     shift; cmd_sh "$@" ;;
+  bundle) shift; cmd_bundle "$@" ;;
+  ls)     cmd_ls ;;
+  cat)    shift; cmd_cat "$@" ;;
+  clean)  shift; cmd_clean "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *)      echo "dx: unknown subcommand '$1'" >&2; usage; exit 2 ;;
+esac

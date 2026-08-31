@@ -1,0 +1,19 @@
+{{/*
+OpenShift's Network Operator watches for this label and fills the ConfigMap
+with ca-bundle.crt - the system trust store plus any CA the cluster has been
+told to trust, which is what signs gitlab-legacy.example.com, Nexus and
+Jenkins.
+
+We create it empty on purpose. The operator owns the contents, so ArgoCD must
+be told not to fight it or it will keep reverting the injected data to nothing.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.app_name }}-trusted-ca
+  labels:
+    {{- include "helm.labels" . | nindent 4 }}
+    config.openshift.io/inject-trusted-cabundle: "true"
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false

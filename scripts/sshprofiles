@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+sshprofiles - turn ~/.ssh/config into VS Code terminal profiles and SSH FS
+entries.
+
+MobaXterm's saved-session sidebar, using what VS Code already has. Every Host
+entry becomes an entry in the terminal dropdown labelled with where it actually
+goes - `ssh: app-server-web (sreuser@10.20.30.40)` - so you can tell two
+similarly named boxes apart without opening the config.
+
+    sshprofiles           regenerate from ~/.ssh/config
+    sshprofiles --list    show what would be generated, change nothing
+
+The address is resolved with `ssh -G <alias>`, not by reading the config, so
+what you see is exactly what ssh will do. That matters when the config mixes
+alias blocks with IP-glob blocks: ssh takes the first value it finds for each
+keyword across every matching block, and reproducing that by hand gets it wrong.
+
+Run it again whenever you edit ~/.ssh/config. Only the generated entries are
+rewritten - your own profiles and every other setting are left alone.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+SSH_CONFIG = os.path.expanduser("~/.ssh/config")
+SETTINGS = os.path.expanduser(
+    "~/.local/share/code-server/User/settings.json")
+
+# Wildcards (Host *) are defaults, not destinations, and negations are
+# exclusions. Neither is something you can connect to.
+SKIP = re.compile(r"[*?!]")
+
+# The character set SSH FS accepts for a config name, copied from the
+# extension's own check. It builds ssh://<name>/ URIs out of these, which is
+# why spaces and brackets are refused. re.ASCII so \w means what it means in
+# JavaScript rather than matching accented letters.
+SSHFS_NAME = re.compile(r"^[\w\\/.@+-]+$", re.ASCII)
+
+
+def hosts():
+    if not os.path.exists(SSH_CONFIG):
+        print(f"sshprofiles: no {SSH_CONFIG}", file=sys.stderr)
+        return []
+    found = []
+    with open(SSH_CONFIG) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("host "):
+                for alias in line.split(None, 1)[1].split():
+                    if not SKIP.search(alias) and alias not in found:
+                        found.append(alias)
+    return found
+
+
+def resolve(alias):
+    """Ask ssh where this alias actually points.
+
+    `ssh -G` prints the fully merged effective configuration without
+    connecting to anything, so this is free and offline.
+
+    -F names the config explicitly rather than letting ssh find it: ssh
+    expands `~` from the passwd entry, not $HOME, and in this image that entry
+    is synthesised at start-up for whatever UID OpenShift handed us. Naming
+    the file removes the dependency on that having gone right.
+    """
+    info = {"hostname": alias, "user": "", "port": "22", "identityfile": ""}
+    try:
+        out = subprocess.run(
+            ["ssh", "-F", SSH_CONFIG, "-G", alias],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return info
+    if out.returncode != 0:
+        return info
+    keys = []
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, val = parts[0].lower(), parts[1].strip()
+        if key == "identityfile":
+            keys.append(os.path.expanduser(val))
+        elif key in info and val:
+            info[key] = val
+    # ssh prints every candidate key, including the built-in defaults it will
+    # never find. Take the first one that is actually on disk.
+    for k in keys:
+        if os.path.isfile(k):
+            info["identityfile"] = k
+            break
+    return info
+
+
+def label(alias, info):
+    """`ssh: name (user@address)`, with the port only when it is not 22."""
+    addr = info["hostname"]
+    if info["user"]:
+        addr = f"{info['user']}@{addr}"
+    if info["port"] and info["port"] != "22":
+        addr = f"{addr}:{info['port']}"
+    if addr in (alias, f"{info['user']}@{alias}"):
+        # Alias is the real hostname - no point repeating it.
+        return f"ssh: {alias}"
+    return f"ssh: {alias} ({addr})"
+
+
+def strip_jsonc(text):
+    """Drop // comments so json.loads accepts a VS Code settings file.
+
+    Naive on purpose: it only ignores // inside a double-quoted string, which
+    is enough for settings.json and avoids pulling in a JSON5 dependency.
+    """
+    out, in_str, escaped = [], False, False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+                out.append(c)
+            elif c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+                while i < len(text) and text[i] != "\n":
+                    i += 1
+                continue
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def main():
+    aliases = hosts()
+    if not aliases:
+        print("sshprofiles: no usable Host entries found")
+        return 1
+
+    resolved = [(a, resolve(a)) for a in aliases]
+
+    if "--list" in sys.argv:
+        width = max(len(a) for a in aliases)
+        for alias, info in resolved:
+            user = f"{info['user']}@" if info["user"] else ""
+            port = "" if info["port"] == "22" else f":{info['port']}"
+            print(f"{alias:<{width}}  {user}{info['hostname']}{port}")
+        return 0
+
+    settings = {}
+    if os.path.exists(SETTINGS):
+        raw = open(SETTINGS).read().strip()
+        if raw:
+            try:
+                settings = json.loads(strip_jsonc(raw))
+            except json.JSONDecodeError as e:
+                print(f"sshprofiles: {SETTINGS} is not valid JSON ({e}).\n"
+                      "  Fix it by hand first - refusing to overwrite.",
+                      file=sys.stderr)
+                return 1
+
+    profiles = settings.get("terminal.integrated.profiles.linux", {})
+
+    # Drop previously generated entries so removed hosts disappear, and so a
+    # renamed label does not leave the old one behind. Anything the user added
+    # themselves has no _devbox marker and survives.
+    profiles = {k: v for k, v in profiles.items()
+                if not (isinstance(v, dict) and v.get("_devbox") == "ssh")}
+
+    for alias, info in resolved:
+        profiles[label(alias, info)] = {
+            "path": "ssh",
+            "args": [alias],
+            "icon": "remote",
+            "_devbox": "ssh",
+        }
+
+    settings["terminal.integrated.profiles.linux"] = profiles
+    # zsh stays the default; the ssh profiles are things you pick deliberately.
+    settings.setdefault("terminal.integrated.defaultProfile.linux", "zsh")
+
+    # SSH FS entries come from the same list, so the remote file browser and
+    # the terminal dropdown can never drift apart.
+    #
+    # Every field is filled in from `ssh -G` rather than pointing at the alias,
+    # because SSH FS does not read ~/.ssh/config at all - it has no notion of
+    # Host blocks, IdentityFile or ProxyJump, only its own host/username/
+    # privateKeyPath fields. Given an alias it would try to resolve that name
+    # in DNS and fail.
+    #
+    # `name` is the connection identifier and ends up in a URI as
+    # ssh://<name>/, so it stays plain. `label` is what the extension shows in
+    # the tree and the workspace folder, so the address goes there.
+    # The extension lowercases every name and then rejects anything outside
+    # its own character set, popping a modal per bad entry. Drop those rather
+    # than leave them to nag: a name it refuses is not a working config, so
+    # there is nothing to preserve. Everything else that is not ours is left
+    # untouched.
+    ours = {a.lower() for a, _ in resolved}
+    kept, dropped = [], 0
+    for c in settings.get("sshfs.configs", []):
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").lower()
+        if name in ours:
+            continue
+        if not SSHFS_NAME.match(name):
+            dropped += 1
+            continue
+        kept.append(c)
+    entries = []
+    unnameable = []
+    for alias, info in resolved:
+        if not SSHFS_NAME.match(alias.lower()):
+            unnameable.append(alias)
+            continue
+        entry = {
+            "name": alias.lower(),
+            "label": label(alias, info).replace("ssh: ", "", 1),
+            "host": info["hostname"],
+            "port": int(info["port"]) if info["port"].isdigit() else 22,
+            "root": "/",
+        }
+        if info["user"]:
+            entry["username"] = info["user"]
+        if info["identityfile"]:
+            entry["privateKeyPath"] = info["identityfile"]
+        entries.append(entry)
+    settings["sshfs.configs"] = kept + entries
+
+    missing = [a for a, i in resolved if not i["identityfile"]]
+
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    with open(SETTINGS, "w") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+
+    print(f"wrote {len(resolved)} ssh profiles and SSH FS entries:")
+    for alias, info in resolved:
+        print(f"  {label(alias, info)}")
+    if dropped:
+        print(f"\nRemoved {dropped} SSH FS entr"
+              f"{'y' if dropped == 1 else 'ies'} with a name the extension "
+              "rejects.")
+    if unnameable:
+        print("\nSSH FS cannot name these, so they have terminal profiles "
+              "only: " + ", ".join(unnameable))
+        print("Rename the Host entry to letters, digits, . _ - + @ / to fix.")
+    if missing:
+        print("\nNo private key found on disk for: " + ", ".join(missing))
+        print("Those SSH FS entries will prompt for a password. The terminal")
+        print("profiles are unaffected - ssh reads the config itself.")
+    print("\nReload the window, then open the terminal dropdown (the v next")
+    print("to +) to see them. SSH FS entries appear under the SSH FS view.")
+    print("Comments in settings.json are stripped when rewriting - that is")
+    print("expected, the settings themselves are preserved.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

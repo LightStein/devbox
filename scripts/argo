@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+argo - ArgoCD sync and health, without opening the UI.
+
+    argo                    every application: sync, health, revision
+    argo <name>             one application in detail
+    argo watch <name>       block until it settles, then say what happened
+    argo -n <ns>            limit to applications in one namespace
+
+Reads the Application custom resources through oc, so it uses whatever context
+you are on and needs no ArgoCD login or token. `incluster` is enough - these
+are reads.
+
+The question this answers is "did my push land". After committing, run
+`argo watch <app>` and it tells you when ArgoCD has picked the commit up and
+whether it went green, instead of refreshing a browser tab.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+# Colour only when attached to a terminal, and never when NO_COLOR is set.
+_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if _TTY else text
+
+
+def paint(value):
+    """Green for the states you want, red for the ones you do not."""
+    good = {"Synced", "Healthy", "Succeeded", "Running"}
+    bad = {"OutOfSync", "Degraded", "Failed", "Error", "Missing", "Unknown"}
+    if value in good:
+        return c(value, "32")
+    if value in bad:
+        return c(value, "31")
+    if value == "Progressing":
+        return c(value, "33")
+    return value
+
+
+def oc(*args):
+    p = subprocess.run(["oc", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        err = (p.stderr or "").strip()
+        if "forbidden" in err.lower() or "cannot list" in err.lower():
+            print("argo: not allowed to read ArgoCD Applications.\n"
+                  "  cluster-reader does not always extend to custom resources.\n"
+                  "  A cluster admin can grant it with:\n"
+                  "    oc create clusterrole argocd-app-reader \\\n"
+                  "      --verb=get,list,watch --resource=applications.argoproj.io\n"
+                  "    oc adm policy add-cluster-role-to-user argocd-app-reader \\\n"
+                  f"      -z {os.environ.get('DEVBOX_SA', 'devbox-<user>')} "
+                  "-n <your-namespace>", file=sys.stderr)
+        elif "the server doesn't have a resource type" in err.lower():
+            print("argo: no Application CRD on this cluster - is ArgoCD installed here?",
+                  file=sys.stderr)
+        elif "must be logged in" in err.lower():
+            print("argo: not authenticated. `oc config use-context incluster`"
+                  " uses the ServiceAccount token, which does not expire.",
+                  file=sys.stderr)
+        else:
+            print(f"argo: {err}", file=sys.stderr)
+        sys.exit(1)
+    return p.stdout
+
+
+def applications(namespace=None):
+    args = ["get", "applications.argoproj.io", "-o", "json"]
+    args += ["-n", namespace] if namespace else ["-A"]
+    return json.loads(oc(*args)).get("items", [])
+
+
+def summarise(app):
+    st = app.get("status", {})
+    op = st.get("operationState", {})
+    return {
+        "name": app["metadata"]["name"],
+        "namespace": app["metadata"]["namespace"],
+        "sync": st.get("sync", {}).get("status", "Unknown"),
+        "health": st.get("health", {}).get("status", "Unknown"),
+        "revision": (st.get("sync", {}).get("revision") or "")[:7],
+        "phase": op.get("phase", ""),
+        "message": op.get("message", "") or st.get("health", {}).get("message", ""),
+        "finished": op.get("finishedAt", ""),
+        "dest": app.get("spec", {}).get("destination", {}).get("namespace", ""),
+        "path": app.get("spec", {}).get("source", {}).get("path", ""),
+        "target": app.get("spec", {}).get("source", {}).get("targetRevision", ""),
+        "resources": st.get("resources", []) or [],
+        "conditions": st.get("conditions", []) or [],
+    }
+
+
+def cmd_list(namespace=None, filt=None):
+    rows = [summarise(a) for a in applications(namespace)]
+    if filt:
+        rows = [r for r in rows if filt.lower() in r["name"].lower()]
+    if not rows:
+        print("no applications" + (f" matching '{filt}'" if filt else ""))
+        return 1
+    rows.sort(key=lambda r: r["name"])
+
+    w = max(len(r["name"]) for r in rows)
+    print(f"{'NAME'.ljust(w)}  {'SYNC':<10} {'HEALTH':<12} {'REV':<8} PATH")
+    for r in rows:
+        # ljust before painting: escape codes would break the column width.
+        print(f"{r['name'].ljust(w)}  "
+              f"{paint(r['sync'].ljust(10))} "
+              f"{paint(r['health'].ljust(12))} "
+              f"{r['revision']:<8} {r['path']}")
+
+    bad = [r for r in rows if r["sync"] != "Synced" or r["health"] != "Healthy"]
+    print()
+    noun = "application" if len(rows) == 1 else "applications"
+    print(f"{len(rows)} {noun}, {len(rows) - len(bad)} synced and healthy")
+    return 0
+
+
+def cmd_show(name, namespace=None, quiet=False):
+    rows = [r for r in (summarise(a) for a in applications(namespace))
+            if r["name"] == name]
+    if not rows:
+        # quiet when the caller intends to retry the argument as a filter -
+        # otherwise `argo devbox` complains before doing the useful thing.
+        if not quiet:
+            print(f"argo: no application called '{name}'", file=sys.stderr)
+        return 1
+    r = rows[0]
+    print(f"{c(r['name'], '1')}   {paint(r['sync'])}  {paint(r['health'])}")
+    print(f"  project path : {r['path']}  ({r['target'] or 'HEAD'})")
+    print(f"  destination  : {r['dest']}")
+    print(f"  revision     : {r['revision']}")
+    if r["phase"]:
+        print(f"  last sync    : {paint(r['phase'])}"
+              + (f"  {r['finished']}" if r["finished"] else ""))
+    if r["message"]:
+        print(f"  message      : {r['message'][:300]}")
+
+    off = [x for x in r["resources"]
+           if x.get("status") not in (None, "Synced")
+           or (x.get("health") or {}).get("status") in ("Degraded", "Missing")]
+    if off:
+        noun = "resource" if len(off) == 1 else "resources"
+        print(f"\n  {len(off)} {noun} not settled:")
+        for x in off[:25]:
+            health = (x.get("health") or {}).get("status", "")
+            print(f"    {x.get('kind','?'):<22} {x.get('name','?'):<32} "
+                  f"{paint(x.get('status','?'))} {paint(health)}")
+        if len(off) > 25:
+            print(f"    ... and {len(off) - 25} more")
+
+    for cond in r["conditions"]:
+        print(f"\n  {paint(cond.get('type',''))}: {cond.get('message','')[:300]}")
+    return 0
+
+
+def cmd_watch(name, namespace=None, interval=10, timeout=1800):
+    """Poll until the application settles.
+
+    Settled means ArgoCD is not mid-operation and the app is either green or
+    has clearly failed. Only changes are printed, so a long sync does not
+    scroll away the thing you were reading.
+    """
+    started, last = time.time(), None
+    print(f"watching {name} - Ctrl+C to stop")
+    while True:
+        rows = [r for r in (summarise(a) for a in applications(namespace))
+                if r["name"] == name]
+        if not rows:
+            print(f"argo: no application called '{name}'", file=sys.stderr)
+            return 1
+        r = rows[0]
+        state = (r["sync"], r["health"], r["phase"], r["revision"])
+        if state != last:
+            stamp = time.strftime("%H:%M:%S")
+            print(f"  {stamp}  {paint(r['sync'])}  {paint(r['health'])}"
+                  f"  {r['revision']}" + (f"  {paint(r['phase'])}" if r["phase"] else ""))
+            last = state
+
+        if r["phase"] not in ("Running", ""):
+            if r["sync"] == "Synced" and r["health"] == "Healthy":
+                print(c("\nsettled: synced and healthy", "32"))
+                return 0
+            if r["health"] == "Degraded" or r["phase"] in ("Failed", "Error"):
+                print(c(f"\nfailed: {r['message'][:300]}", "31"))
+                return 2
+
+        if time.time() - started > timeout:
+            print(f"\ngave up after {timeout}s - still "
+                  f"{r['sync']}/{r['health']}", file=sys.stderr)
+            return 3
+        time.sleep(interval)
+
+
+def main():
+    args = sys.argv[1:]
+    namespace = None
+    if "-n" in args:
+        i = args.index("-n")
+        if i + 1 >= len(args):
+            print("argo: -n needs a namespace", file=sys.stderr)
+            return 2
+        namespace = args[i + 1]
+        del args[i:i + 2]
+
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if args and args[0] == "watch":
+        if len(args) < 2:
+            print("argo watch <name>", file=sys.stderr)
+            return 2
+        return cmd_watch(args[1], namespace)
+    if args:
+        # Exact name first, then treat the argument as a filter. Saves having
+        # to remember whether an app is `devbox` or `devbox-alice`.
+        if cmd_show(args[0], namespace, quiet=True) == 0:
+            return 0
+        return cmd_list(namespace, args[0])
+    return cmd_list(namespace)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

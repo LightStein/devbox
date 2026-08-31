@@ -1,0 +1,184 @@
+{{/*
+StatefulSet rather than Deployment for the stable pod name - devbox-<user>-0.
+With console-only access, being able to find the same pod name every time in
+the OpenShift UI matters more than it would elsewhere.
+
+PVCs are declared separately rather than via volumeClaimTemplates, so they can
+carry the keep / Prune=false annotations and survive the chart being removed.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.app_name }}
+  labels:
+    app: {{ .Values.app_name }}
+spec:
+  serviceName: {{ .Values.app_name }}-headless
+  # Always one, unless an environment block overrides it. This is a personal
+  # workstation, not a scaled service.
+  replicas: {{ template "replicas" . }}
+  # One pod, one home directory. Two pods writing the same shell history and
+  # editor state would corrupt both.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "helm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "helm.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.app_name }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        # ---------------------------------------------------------------
+        # oauth-proxy: the only thing reachable from the Route.
+        # ---------------------------------------------------------------
+        - name: oauth-proxy
+          image: "{{ .Values.proxyImage.registry }}/{{ .Values.proxyImage.repository }}:{{ .Values.proxyImage.tag }}"
+          imagePullPolicy: "{{ .Values.proxyImage.pullPolicy }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.PROXY_PORT }}
+              protocol: TCP
+          args:
+            - --provider=openshift
+            - --http-address=0.0.0.0:{{ .Values.PROXY_PORT }}
+            - --https-address=
+            - --upstream=http://127.0.0.1:{{ .Values.CODE_SERVER_PORT }}
+            - --openshift-service-account={{ .Values.app_name }}
+            # Authorisation, not just authentication. Without this any valid
+            # cluster user could open this box; with it, only users who can act
+            # in this namespace can. That is what keeps colleagues out of each
+            # other's workstations once more than one exists.
+            - --openshift-sar={"namespace":"{{ .Release.Namespace }}","resource":"pods","verb":"get"}
+            - --cookie-secret-file=/etc/proxy/secrets/session_secret
+            - --cookie-expire=8h
+            - --pass-user-headers=true
+            - --skip-provider-button=true
+          volumeMounts:
+            - name: proxy-secrets
+              mountPath: /etc/proxy/secrets
+              readOnly: true
+          resources:
+            {{- toYaml .Values.proxyResources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /oauth/healthz
+              port: {{ .Values.PROXY_PORT }}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+        # ---------------------------------------------------------------
+        # devbox: the workstation. Binds loopback only.
+        # ---------------------------------------------------------------
+        - name: devbox
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: "{{ .Values.image.pullPolicy }}"
+          # ENTRYPOINT is the entrypoint script; this replaces CMD only.
+          args:
+            - code-server
+            - --bind-addr
+            - 127.0.0.1:{{ .Values.CODE_SERVER_PORT }}
+            # Safe because of the bind address above: nothing outside this pod
+            # can reach the port, and oauth-proxy has already established who
+            # the user is before forwarding.
+            - --auth
+            - none
+            - --disable-telemetry
+            - --disable-update-check
+            - /work
+          envFrom:
+            - configMapRef:
+                name: "{{ .Values.app_name }}-environment"
+            {{- if .Values.secrets.env }}
+            - secretRef:
+                name: {{ include "devbox.envSecret" . }}
+                optional: true
+            {{- end }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/dev
+            - name: work
+              mountPath: /work
+            - name: ssh-keys
+              mountPath: /run/secrets/devbox-ssh
+              readOnly: true
+            # Overlays the RHEL trust bundle, so curl, git, python and oc all
+            # trust the internal CA without per-tool configuration. This is
+            # what makes gitlab-legacy.example.com, Nexus and Jenkins work
+            # without -k or sslVerify=false.
+            - name: trusted-ca
+              mountPath: /etc/pki/ca-trust/extracted/pem
+              readOnly: true
+          resources: {{ template "resources" . }}
+          # exec, not httpGet. The kubelet runs httpGet probes from the node's
+          # network namespace, so `host: 127.0.0.1` would dial the node's
+          # loopback, not the container's - and code-server binds container
+          # loopback on purpose. exec runs inside the container, where
+          # 127.0.0.1 means what we want it to mean.
+          startupProbe:
+            exec:
+              command:
+                - /usr/bin/curl
+                - -fsS
+                - -o
+                - /dev/null
+                - http://127.0.0.1:{{ .Values.CODE_SERVER_PORT }}/healthz
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            # Up to ~2.5 minutes to come up before liveness starts policing it.
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - /usr/bin/curl
+                - -fsS
+                - -o
+                - /dev/null
+                - http://127.0.0.1:{{ .Values.CODE_SERVER_PORT }}/healthz
+            periodSeconds: 30
+            failureThreshold: 4
+          readinessProbe:
+            exec:
+              command:
+                - /usr/bin/curl
+                - -fsS
+                - -o
+                - /dev/null
+                - http://127.0.0.1:{{ .Values.CODE_SERVER_PORT }}/healthz
+            periodSeconds: 10
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: {{ .Values.app_name }}-home
+        - name: work
+          persistentVolumeClaim:
+            claimName: {{ .Values.app_name }}-work
+        - name: proxy-secrets
+          secret:
+            secretName: {{ include "devbox.proxySecret" . }}
+        - name: trusted-ca
+          configMap:
+            name: {{ .Values.app_name }}-trusted-ca
+            items:
+              - key: ca-bundle.crt
+                path: tls-ca-bundle.pem
+            # The operator fills this in after the ConfigMap is created, so a
+            # first sync can race it. optional keeps the pod schedulable.
+            optional: true
+        - name: ssh-keys
+          secret:
+            secretName: {{ include "devbox.sshSecret" . }}
+            optional: true
+            # 0400 would be unreadable to the random UID OpenShift assigns.
+            # The entrypoint re-copies these to ~/.ssh at 0600 anyway, since
+            # ssh refuses to use keys from a group-readable mount.
+            defaultMode: 0444
+      restartPolicy: Always

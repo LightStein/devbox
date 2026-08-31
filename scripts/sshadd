@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+sshadd - add an ssh session without hand-editing config files.
+
+MobaXterm's "new session" form, as a guided prompt. Asks for a name, host,
+user and key (picking the key from a list rather than making you type a path),
+writes ~/.ssh/config correctly, and then regenerates the VS Code terminal
+profiles and the SSH FS entry so the session shows up everywhere at once.
+
+    sshadd              add a session
+    sshadd --list       show configured sessions
+    sshadd --rm <name>  remove one
+
+Why this exists rather than just editing the file: ssh takes the FIRST value
+it finds for each keyword, so a new Host block placed after `Host *` silently
+inherits the wrong key. This inserts in the right place every time.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+SSH_DIR = os.path.expanduser("~/.ssh")
+SSH_CONFIG = os.path.join(SSH_DIR, "config")
+
+GLOBAL_BLOCK = """# ---- global defaults ----
+# IdentitiesOnly is what makes per-host keys work: IdentityFile accumulates
+# rather than overriding, so without this ssh offers every key it knows to
+# every host and some servers disconnect after too many attempts.
+Host *
+    ServerAliveInterval 30
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    IdentitiesOnly yes
+"""
+
+
+def ask(prompt, default=None, required=True):
+    suffix = f" [{default}]" if default else ""
+    while True:
+        val = input(f"{prompt}{suffix}: ").strip()
+        if not val and default:
+            return default
+        if val or not required:
+            return val
+        print("  required")
+
+
+def pick_key():
+    keys = []
+    if os.path.isdir(SSH_DIR):
+        for f in sorted(os.listdir(SSH_DIR)):
+            p = os.path.join(SSH_DIR, f)
+            if not os.path.isfile(p) or f.endswith((".pub", ".env")):
+                continue
+            if f in ("config", "known_hosts", "authorized_keys"):
+                continue
+            with open(p, "rb") as fh:
+                if b"PRIVATE KEY" in fh.read(200):
+                    keys.append(f)
+    if not keys:
+        print("no private keys in ~/.ssh - generate one first:")
+        print("  ssh-keygen -t ed25519 -f ~/.ssh/id_<name>")
+        sys.exit(1)
+
+    if shutil.which("fzf") and sys.stdin.isatty():
+        p = subprocess.run(
+            ["fzf", "--reverse", "--height=40%", "--prompt", "key> ",
+             "--header", "which key does this host use?"],
+            input="\n".join(keys), capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+
+    for i, k in enumerate(keys, 1):
+        print(f"  {i}) {k}")
+    while True:
+        choice = input("key number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(keys):
+            return keys[int(choice) - 1]
+
+
+def read_config():
+    if not os.path.exists(SSH_CONFIG):
+        return ""
+    return open(SSH_CONFIG).read()
+
+
+def existing_hosts(text):
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("host ") and not line.startswith("#"):
+            out += [h for h in line.split(None, 1)[1].split()
+                    if not re.search(r"[*?!]", h)]
+    return out
+
+
+def write_config(text):
+    os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+    if os.path.exists(SSH_CONFIG):
+        shutil.copy2(SSH_CONFIG, SSH_CONFIG + ".bak")
+    with open(SSH_CONFIG, "w") as fh:
+        fh.write(text)
+    os.chmod(SSH_CONFIG, 0o600)
+
+
+def insert_block(text, block):
+    """Put the new Host block before any `Host *`, and append the global
+    defaults if they are missing. Order matters: ssh takes the first value it
+    finds, so a specific block after `Host *` inherits the wrong settings."""
+    lines = text.splitlines(keepends=True)
+    idx = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*Host\s+.*\*", line, re.I):
+            idx = i
+            break
+    if idx is None:
+        body = text.rstrip()
+        joiner = "\n\n" if body else ""
+        return f"{body}{joiner}{block}\n{GLOBAL_BLOCK}"
+    # Keep any comment lines immediately above the wildcard block with it.
+    while idx > 0 and lines[idx - 1].lstrip().startswith("#"):
+        idx -= 1
+    return "".join(lines[:idx]) + block + "\n" + "".join(lines[idx:])
+
+
+def sync_downstream(name, host):
+    """Regenerate the terminal profiles and SSH FS entries.
+
+    sshprofiles owns both lists and rebuilds them from ~/.ssh/config, so this
+    only has to call it - writing an SSH FS entry here too would duplicate the
+    one it just made.
+    """
+    if not shutil.which("sshprofiles"):
+        print("  (sshprofiles not on PATH - no terminal profile or SSH FS "
+              "entry created)")
+        return
+    subprocess.run(["sshprofiles"], stdout=subprocess.DEVNULL)
+    print("  terminal profile and SSH FS entry added")
+
+
+def cmd_add():
+    text = read_config()
+    have = existing_hosts(text)
+
+    print("New ssh session. Ctrl+C to abort.\n")
+    name = ask("short name (what you will type after `ssh`)")
+    if name in have:
+        print(f"sshadd: '{name}' already exists in ~/.ssh/config")
+        return 1
+    host = ask("hostname or IP")
+    user = ask("username")
+    key = pick_key()
+    port = ask("port", default="22")
+    jump = ask("jump host (blank for none)", required=False)
+
+    block = f"# ---- {name} ----\nHost {name}\n"
+    block += f"    HostName {host}\n"
+    block += f"    User {user}\n"
+    block += f"    IdentityFile ~/.ssh/{key}\n"
+    if port != "22":
+        block += f"    Port {port}\n"
+    if jump:
+        block += f"    ProxyJump {jump}\n"
+
+    write_config(insert_block(text, block))
+    print(f"\nwrote ~/.ssh/config (previous saved as config.bak)")
+    sync_downstream(name, host)
+
+    print(f"\nTest it:\n  ssh -o BatchMode=yes {name} hostname")
+    print("BatchMode fails fast instead of prompting, so a wrong key is an")
+    print("immediate error rather than a hang.")
+    return 0
+
+
+def cmd_list():
+    hosts = existing_hosts(read_config())
+    if not hosts:
+        print("no sessions configured")
+        return 0
+    # sshprofiles resolves each alias through `ssh -G`, so it can show the
+    # address each name really points at. Fall back to bare names if it is
+    # not on PATH.
+    if shutil.which("sshprofiles"):
+        return subprocess.run(["sshprofiles", "--list"]).returncode
+    for h in hosts:
+        print(h)
+    return 0
+
+
+def cmd_rm(name):
+    text = read_config()
+    if name not in existing_hosts(text):
+        print(f"sshadd: no session called '{name}'")
+        return 1
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.lower().startswith("host "):
+            aliases = stripped.split(None, 1)[1].split()
+            skipping = aliases == [name]
+            if skipping and out and out[-1].strip().startswith("# ----"):
+                out.pop()
+        if not skipping:
+            out.append(line)
+    write_config("".join(out))
+    print(f"removed {name} (previous saved as config.bak)")
+    if shutil.which("sshprofiles"):
+        subprocess.run(["sshprofiles"], stdout=subprocess.DEVNULL)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        if "--list" in sys.argv:
+            sys.exit(cmd_list())
+        if "--rm" in sys.argv:
+            i = sys.argv.index("--rm")
+            if i + 1 >= len(sys.argv):
+                print("sshadd --rm <name>")
+                sys.exit(2)
+            sys.exit(cmd_rm(sys.argv[i + 1]))
+        sys.exit(cmd_add())
+    except KeyboardInterrupt:
+        print("\naborted")
+        sys.exit(130)

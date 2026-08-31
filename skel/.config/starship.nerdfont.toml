@@ -1,0 +1,58 @@
+# Glyph version. Requires JetBrainsMono Nerd Font installed on YOUR machine -
+# see /work/fonts/JetBrainsMonoNerdFont.zip. Activate with:
+#   cp ~/.config/starship.nerdfont.toml ~/.config/starship.toml
+# If you see boxes or question marks, the font is not installed and you should
+# copy starship.toml back from /etc/devbox-skel/.config/.
+
+add_newline = true
+command_timeout = 1000
+
+format = """
+$directory$git_branch$git_status$kubernetes
+$character"""
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"
+
+[directory]
+style = "bold cyan"
+truncation_length = 4
+truncate_to_repo = false
+
+[git_branch]
+symbol = " "
+style = "bold purple"
+format = "[$symbol$branch]($style) "
+
+[git_status]
+style = "bold yellow"
+format = "([$all_status$ahead_behind]($style) )"
+conflicted = "!"
+ahead = "^${count}"
+behind = "v${count}"
+diverged = "^v"
+untracked = "?"
+modified = "*"
+staged = "+"
+stashed = "$"
+
+# The reason starship is here at all. One typo away from the wrong cluster is
+# a bad place to be, so context and namespace are always on screen.
+[kubernetes]
+disabled = false
+symbol = "☸ "
+style = "bold blue"
+format = '[$symbol$context\($namespace\)]($style) '
+
+
+# `oc` names contexts <namespace>/<server>/<user>, which renders as
+# devbox-alice/api-dev-example-com:6443/alice and swamps the prompt.
+# Collapse it to the cluster name.
+[[kubernetes.contexts]]
+context_pattern = '.*/api-(?P<var_cluster>[a-z0-9-]+)-example-com:6443/.*'
+context_alias = '$var_cluster'
+
+[cmd_duration]
+min_time = 2000
+format = "took [$duration](bold yellow) "

@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+nexus - search and browse Nexus from the terminal.
+
+    nexus                     browse repositories
+    nexus <term>              search every repository
+    nexus -r <repo> <term>    search one repository
+
+Search asks the server, so a partial name is enough and you never descend
+through group/artifact/version by hand. On a docker result you get a ready
+pull reference; on anything else, the download URL or the file itself.
+
+Browsing is still there for when you know where a thing lives. Arrow keys to
+move, Enter to descend, `..` to go back.
+
+Deliberately lazy: it fetches exactly one directory level per keystroke.
+`rclone ncdu` was the obvious alternative and it walks the whole tree to
+compute sizes, which on a Docker repo with thousands of blobs is unusable.
+
+Uses Nexus's own browse endpoint (/service/rest/repository/browse/...), which
+works for every repository format rather than just raw.
+
+Config, in order of precedence:
+    NEXUS_URL, NEXUS_USER, NEXUS_PASS   environment
+    NEXUS_DOCKER_HOST                   registry host for pull references
+    ~/.config/devbox/nexus.env          KEY=value lines
+
+Put the credentials in the devbox env Secret and they arrive as environment
+variables, so nothing needs looking up.
+"""
+
+import base64
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG = os.path.expanduser("~/.config/devbox/nexus.env")
+WORK = os.environ.get("DEVBOX_WORK", "/work")
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG):
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip("'\"")
+    for key in ("NEXUS_URL", "NEXUS_USER", "NEXUS_PASS",
+                "NEXUS_CA", "NEXUS_INSECURE", "NEXUS_DOCKER_HOST"):
+        if os.environ.get(key):
+            cfg[key] = os.environ[key]
+    return cfg
+
+
+CFG = load_config()
+BASE = (CFG.get("NEXUS_URL") or "").rstrip("/")
+USER = CFG.get("NEXUS_USER", "")
+PASS = CFG.get("NEXUS_PASS", "")
+
+# Nexus serves its API and its Docker registry on different hostnames at your organisation -
+# the API and the registry often sit on different hostnames. A pull
+# reference has to name the registry, not the API, so it cannot be derived from
+# NEXUS_URL. Override with NEXUS_DOCKER_HOST when that assumption is wrong.
+DOCKER_HOST = CFG.get("NEXUS_DOCKER_HOST", "registry.example.com")
+
+
+# Trust normally comes from SSL_CERT_FILE, which the entrypoint points at the
+# bundle trustca composes. NEXUS_CA overrides it for a one-off host;
+# NEXUS_INSECURE=1 skips verification entirely and should only ever be used to
+# confirm that TLS is the problem. Both may be set in nexus.env so they
+# survive a restart.
+def ssl_context():
+    if CFG.get("NEXUS_INSECURE") == "1":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    ca = CFG.get("NEXUS_CA")
+    if ca:
+        ctx = ssl.create_default_context(cafile=os.path.expanduser(ca))
+    else:
+        # create_default_context honours SSL_CERT_FILE, which the entrypoint
+        # points at the composed bundle - the cluster-injected CAs plus
+        # anything trustca has pinned. Hard-coding /etc/pki/tls/cert.pem here
+        # was the bug: that is the cluster bundle alone, and it does not
+        # contain the internal CA that signs Nexus.
+        ctx = ssl.create_default_context()
+    # Let an intermediate act as a trust anchor. Internal hosts routinely serve
+    # a chain whose root is nowhere on this machine, and pinning the issuer
+    # rather than the leaf is what survives certificate renewal.
+    flag = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", None)
+    if flag is not None:
+        ctx.verify_flags |= flag
+    return ctx
+
+
+SSLCTX = ssl_context()
+
+
+def die(msg, code=1):
+    print(f"nexus: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def get(url):
+    req = urllib.request.Request(url)
+    if USER:
+        token = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=SSLCTX) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        die(f"HTTP {e.code} on {url}")
+    except urllib.error.URLError as e:
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
+            host = urllib.parse.urlsplit(BASE).hostname or "<host>"
+            hint = ("\n  TLS trust failure - this host's issuer is not in the\n"
+                    "  cluster CA bundle. Pin it, then try again:\n"
+                    f"    trustca {host}\n"
+                    "  NEXUS_INSECURE=1 skips verification, for diagnosis only.")
+        die(f"cannot reach {url}: {e.reason}{hint}")
+
+
+def repositories():
+    """Repository list, via the REST API."""
+    import json
+
+    data = json.loads(get(f"{BASE}/service/rest/v1/repositories"))
+    rows = []
+    for r in sorted(data, key=lambda x: (x.get("format", ""), x["name"])):
+        rows.append((r["name"], r.get("format", "?"), r.get("type", "?")))
+    return rows
+
+
+# Nexus's browse pages are a plain table of anchors. Directories carry a
+# trailing slash; everything else is a leaf.
+ANCHOR = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>', re.I)
+
+
+def browse(repo, path):
+    url = f"{BASE}/service/rest/repository/browse/{repo}/"
+    if path:
+        url += path.strip("/") + "/"
+    body = get(url)
+    entries = []
+    for href, text in ANCHOR.findall(body):
+        name = html.unescape(text).strip()
+        if not name or name in ("..", "Parent Directory"):
+            continue
+        # Nexus links children relative to the current page.
+        entries.append((name, href.endswith("/") or name.endswith("/")))
+    seen, out = set(), []
+    for name, is_dir in entries:
+        key = name.rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((key, is_dir))
+    out.sort(key=lambda e: (not e[1], e[0].lower()))
+    return out
+
+
+def fzf(lines, header, prompt):
+    if not shutil.which("fzf"):
+        die("fzf is not installed")
+    p = subprocess.run(
+        ["fzf", "--ansi", "--reverse", "--height=100%",
+         "--header", header, "--prompt", prompt],
+        input="\n".join(lines), capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip()
+
+
+def content_url(repo, path):
+    return f"{BASE}/repository/{repo}/{path.lstrip('/')}"
+
+
+def download(repo, path):
+    dest_dir = os.path.join(WORK, "nexus")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(path))
+    url = content_url(repo, path)
+    req = urllib.request.Request(url)
+    if USER:
+        token = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+    print(f"downloading {url}")
+    with urllib.request.urlopen(req, timeout=300, context=SSLCTX) as resp, open(dest, "wb") as fh:
+        shutil.copyfileobj(resp, fh)
+    size = os.path.getsize(dest)
+    print(f">> {dest}  ({size/1024/1024:.1f} MB)")
+    print("   right-click it in the editor to download to your PC")
+
+
+def search(term, repo=None, limit=500):
+    """Search every repository at once, via Nexus's search API.
+
+    Browsing is fine when you know where a thing lives. When you only know
+    part of its name, descending through group/artifact/version by hand is
+    hopeless - this asks the server instead.
+
+    Results are paged with a continuation token; we follow it up to `limit`
+    components so a broad term cannot hang on a large repository.
+    """
+    import json
+
+    items, token, url = [], None, f"{BASE}/service/rest/v1/search"
+    query = f"q={urllib.parse.quote(term)}"
+    if repo:
+        query += f"&repository={urllib.parse.quote(repo)}"
+    while True:
+        page = url + "?" + query + (f"&continuationToken={token}" if token else "")
+        data = json.loads(get(page))
+        items.extend(data.get("items", []))
+        token = data.get("continuationToken")
+        if not token or len(items) >= limit:
+            break
+    return items[:limit]
+
+
+def coordinates(item):
+    """`group:name:version` for maven, `name:version` for everything else."""
+    name = item.get("name") or "?"
+    if item.get("group") and item.get("format") == "maven2":
+        name = f"{item['group']}:{name}"
+    ver = item.get("version") or ""
+    return f"{name}:{ver}" if ver else name
+
+
+def docker_ref(item):
+    return f"{DOCKER_HOST}/{item.get('name')}:{item.get('version')}"
+
+
+def component_menu(item):
+    assets = item.get("assets") or []
+    while True:
+        opts = []
+        if item.get("format") == "docker":
+            opts.append("print pull reference")
+        if assets:
+            opts.append("print download URL")
+            opts.append("download to /work/nexus")
+        opts.append("show details")
+        opts.append("back")
+        choice = fzf(opts, f"{item.get('repository')}  {coordinates(item)}",
+                     "action> ")
+        if not choice or choice == "back":
+            return
+        if choice == "print pull reference":
+            print(f"\n  podman pull {docker_ref(item)}")
+            print(f"  skopeo copy docker://{docker_ref(item)} docker://<target>")
+        elif choice == "print download URL":
+            for a in assets:
+                print("\n  " + a.get("downloadUrl", "?"))
+        elif choice == "download to /work/nexus":
+            url = assets[0].get("downloadUrl")
+            dest_dir = os.path.join(WORK, "nexus")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(
+                urllib.parse.urlsplit(url).path))
+            req = urllib.request.Request(url)
+            if USER:
+                tok = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+                req.add_header("Authorization", f"Basic {tok}")
+            print(f"downloading {url}")
+            with urllib.request.urlopen(req, timeout=300, context=SSLCTX) as r, \
+                 open(dest, "wb") as fh:
+                shutil.copyfileobj(r, fh)
+            print(f">> {dest}  ({os.path.getsize(dest)/1024/1024:.1f} MB)")
+        elif choice == "show details":
+            print()
+            print(f"  repository : {item.get('repository')}")
+            print(f"  format     : {item.get('format')}")
+            print(f"  coordinates: {coordinates(item)}")
+            for a in assets:
+                print(f"  asset      : {a.get('path')}")
+        input("\npress Enter to continue ")
+
+
+def search_mode(term, repo=None):
+    items = search(term, repo)
+    if not items:
+        print(f"nexus: nothing matching '{term}'"
+              + (f" in {repo}" if repo else ""))
+        return 1
+    while True:
+        rw = max(len(i.get("repository") or "") for i in items)
+        lines = [f"{(i.get('repository') or '').ljust(rw)}  "
+                 f"{(i.get('format') or '').ljust(7)}  {coordinates(i)}"
+                 for i in items]
+        pick = fzf(lines, f"{len(items)} matches for '{term}'", "result> ")
+        if not pick:
+            return 0
+        component_menu(items[lines.index(pick)])
+
+
+def file_menu(repo, path):
+    while True:
+        choice = fzf(
+            ["download to /work/nexus", "print URL", "back"],
+            f"{repo}/{path}", "action> ",
+        )
+        if not choice or choice == "back":
+            return
+        if choice.startswith("download"):
+            download(repo, path)
+            input("\npress Enter to continue ")
+            return
+        if choice == "print URL":
+            print(content_url(repo, path))
+            input("\npress Enter to continue ")
+            return
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Usage before configuration - asking how to use a tool should not require
+    # the tool to be configured.
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    if not BASE:
+        die(f"NEXUS_URL not set. Put it in the environment or {CONFIG}")
+
+    repo = None
+    if args and args[0] in ("-r", "--repo"):
+        if len(args) < 2:
+            die("-r needs a repository name")
+        repo, args = args[1], args[2:]
+    if args:
+        return search_mode(" ".join(args), repo)
+
+    while True:
+        repos = repositories()
+        width = max(len(r[0]) for r in repos)
+        lines = [f"{n.ljust(width)}  {f}/{t}" for n, f, t in repos]
+        pick = fzf(lines, f"{BASE} - {len(repos)} repositories", "repo> ")
+        if not pick:
+            return
+        repo = pick.split()[0]
+
+        path = ""
+        while True:
+            entries = browse(repo, path)
+            lines = ([".."] if True else []) + [
+                (n + "/") if d else n for n, d in entries
+            ]
+            header = f"{repo}/{path}" if path else repo
+            pick = fzf(lines, header, "browse> ")
+            if not pick:
+                return
+            if pick == "..":
+                if not path:
+                    break  # back to the repository list
+                path = "/".join(path.rstrip("/").split("/")[:-1])
+                continue
+            if pick.endswith("/"):
+                path = f"{path}/{pick.rstrip('/')}".strip("/")
+            else:
+                file_menu(repo, f"{path}/{pick}".strip("/"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()

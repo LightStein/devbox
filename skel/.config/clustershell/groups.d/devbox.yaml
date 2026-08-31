@@ -1,0 +1,16 @@
+# Host groups for clush. Names on the left, node ranges on the right.
+# ClusterShell range syntax collapses runs: app-server[1-4] is four hosts, and
+# app-server[1-3,7] is four as well.
+#
+# These names must match Host entries in ~/.ssh/config, so clush inherits the
+# user, key, ProxyJump and ControlMaster settings you already have there.
+#
+# Check what a group expands to before running anything against it:
+#   nodeset -e @app_servers
+#   nodeset -c @app_servers        (count)
+#
+# Replace the examples below.
+devbox:
+  app_servers: app-server[1-4]
+  # forge: forge-[1-7]
+  # prod: prod-app[1-2],prod-db1

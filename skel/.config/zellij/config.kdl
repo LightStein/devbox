@@ -1,0 +1,18 @@
+// Terminal here is always a browser - code-server or the OpenShift console.
+// zellij's mouse handling intercepts the drag before the browser sees it, and
+// copy_on_select puts the text in zellij's own clipboard, which cannot reach
+// the system clipboard. The result is "Copied!" followed by an empty paste.
+// Both off, so selection and right-click copy behave normally.
+mouse_mode false
+copy_on_select false
+
+// Locked by default: Ctrl+g unlocks, then the mode key. Without this, zellij
+// swallows Ctrl+p (VS Code quick-open, and previous-command in bash).
+default_mode "locked"
+
+show_startup_tips false
+
+// The OpenShift console terminal has no nerd-font glyphs, so zellij's default
+// UI renders tab and mode indicators as "?". simplified_ui swaps them for
+// plain ASCII.
+simplified_ui true

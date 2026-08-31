@@ -1,0 +1,6 @@
+apiVersion: v2
+name: devbox
+description: A per-user development workstation that runs inside Kubernetes
+type: application
+version: 0.1.9
+appVersion: "0.1.9"

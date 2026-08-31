@@ -1,0 +1,15 @@
+# ansible inventory. Host aliases here should match ~/.ssh/config entries, so
+# ansible inherits ProxyJump and ControlMaster rather than duplicating them.
+#
+# Ad-hoc run of a script someone handed you, across the group:
+#   ansible app_servers -i ~/ansible/inventory -m script -a "/work/script.sh"
+#
+# Structured run producing an artefact tree you can download whole:
+#   ansible-runner run ~/ansible -m script -a "/work/script.sh" --hosts app_servers
+#   ls ~/ansible/artifacts/<uuid>/
+
+[app_servers]
+app-server1
+app-server2
+app-server3
+app-server4

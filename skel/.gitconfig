@@ -1,0 +1,29 @@
+# Seeded on first start only - the entrypoint never overwrites an existing
+# file, so your own settings always win.
+
+[diff]
+	# Without this, GitLens' "Open Changes with Difftool" and `git difftool`
+	# both fail with "no Git diff tool is configured". The built-in diff in
+	# the Source Control panel never needed it, which makes the error
+	# confusing when you hit it.
+	tool = vscode
+[difftool "vscode"]
+	cmd = code-server --wait --diff \"$LOCAL\" \"$REMOTE\"
+[difftool]
+	prompt = false
+
+[merge]
+	tool = vscode
+[mergetool "vscode"]
+	cmd = code-server --wait \"$MERGED\"
+[mergetool]
+	prompt = false
+	keepBackup = false
+
+[pull]
+	# Rebase rather than merge, so pulling before a push does not litter the
+	# history with merge commits.
+	rebase = true
+
+[init]
+	defaultBranch = main

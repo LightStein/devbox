@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "{{ .Values.app_name }}-environment"
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+data:
+  CODE_SERVER_PORT: {{ .Values.CODE_SERVER_PORT | quote }}
+  # The pod has no way to know its own Route, and `fwd` needs it to print a
+  # usable URL for code-server's /proxy/<port>/ endpoint.
+  DEVBOX_ROUTE: {{ template "ingress.hostName" . }}
+  {{ if eq .Values.env "dev" }}
+  {{- with .Values.dev }}
+  {{- toYaml .config | nindent 2 }}
+  {{- end }}
+  {{ else if eq .Values.env "uat" }}
+  {{- with .Values.uat }}
+  {{- toYaml .config | nindent 2 }}
+  {{- end }}
+  {{ else if eq .Values.env "prod" }}
+  {{- with .Values.prod }}
+  {{- toYaml .config | nindent 2 }}
+  {{- end }}
+  {{ else if eq .Values.env "drc" }}
+  {{- with .Values.drc }}
+  {{- toYaml .config | nindent 2 }}
+  {{- end }}
+  {{ else if eq .Values.env "preview" }}
+  {{- with .Values.preview }}
+  {{- toYaml .config | nindent 2 }}
+  {{- end }}
+  {{ end }}
